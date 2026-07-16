@@ -19,6 +19,7 @@ const io = new Server(server, { cors: { origin: "*" } });
 app.set("io", io);
 app.use(cors());
 app.use(express.json());
+app.use(express.static("public"));
 
 app.get("/", (req, res) => {
   res.json({ status: "ok", service: "sahl-backend", time: new Date().toISOString() });
