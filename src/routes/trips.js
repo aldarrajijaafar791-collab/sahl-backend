@@ -1,45 +1,22 @@
 const express = require("express");
 const { v4: uuid } = require("uuid");
-const { db, VEHICLE_TYPES } = require("../db");
+const { VEHICLE_TYPES } = require("../db");
+const { Users, Drivers, Trips } = require("../repositories");
 const { requireAuth } = require("../middleware/auth");
 const { distanceKm, calculateFare } = require("../utils/geo");
 
 const router = express.Router();
 
-/** يبحث عن أقرب سائق متصل من نفس نوع المركبة ولا يعمل على رحلة أخرى، مع استثناء من رفض الطلب مسبقاً */
-function findNearestDriver(vehicleType, pickup, excludeIds = []) {
-  const busyDriverIds = new Set(
-    [...db.trips.values()]
-      .filter((t) => ["requested", "accepted", "ongoing"].includes(t.status))
-      .map((t) => t.driverId)
-  );
-
-  const candidates = [...db.drivers.values()].filter(
-    (d) =>
-      d.online &&
-      d.vehicleType === vehicleType &&
-      d.lat != null &&
-      d.lng != null &&
-      !busyDriverIds.has(d.userId) &&
-      !excludeIds.includes(d.userId)
-  );
-
-  if (candidates.length === 0) return null;
-
-  candidates.sort(
-    (a, b) =>
-      distanceKm(pickup.lat, pickup.lng, a.lat, a.lng) -
-      distanceKm(pickup.lat, pickup.lng, b.lat, b.lng)
-  );
-  return candidates[0];
-}
-
-function tripToJSON(trip) {
-  const driver = trip.driverId ? db.drivers.get(trip.driverId) : null;
-  const driverUser = trip.driverId ? db.users.get(trip.driverId) : null;
+async function tripToJSON(trip) {
+  if (!trip.driverId) return { ...trip, driver: null };
+  const [driverUser, driver] = await Promise.all([
+    Users.findById(trip.driverId),
+    Drivers.get(trip.driverId),
+  ]);
+  if (!driverUser || !driver) return { ...trip, driver: null };
   return {
     ...trip,
-    driver: driver && driverUser ? {
+    driver: {
       name: driverUser.name,
       phone: driverUser.phone,
       plate: driver.plate,
@@ -47,164 +24,168 @@ function tripToJSON(trip) {
       rating: driver.rating,
       lat: driver.lat,
       lng: driver.lng,
-    } : null,
+    },
   };
 }
 
-// إنشاء طلب رحلة جديد
-router.post("/", requireAuth, (req, res) => {
-  if (req.user.role !== "rider") return res.status(403).json({ error: "هذه الميزة للركاب فقط" });
-  const { vehicleType, pickup, dropoff } = req.body;
-  const vType = VEHICLE_TYPES.find((v) => v.id === vehicleType);
-  if (!vType) return res.status(400).json({ error: "نوع مركبة غير صالح" });
-  if (!pickup?.lat || !pickup?.lng || !dropoff?.lat || !dropoff?.lng) {
-    return res.status(400).json({ error: "إحداثيات نقطة الانطلاق والوجهة مطلوبة" });
-  }
+router.post("/", requireAuth, async (req, res, next) => {
+  try {
+    if (req.user.role !== "rider") return res.status(403).json({ error: "هذه الميزة للركاب فقط" });
+    const { vehicleType, pickup, dropoff } = req.body;
+    const vType = VEHICLE_TYPES.find((v) => v.id === vehicleType);
+    if (!vType) return res.status(400).json({ error: "نوع مركبة غير صالح" });
+    if (!pickup?.lat || !pickup?.lng || !dropoff?.lat || !dropoff?.lng) {
+      return res.status(400).json({ error: "إحداثيات نقطة الانطلاق والوجهة مطلوبة" });
+    }
 
-  const distKm = distanceKm(pickup.lat, pickup.lng, dropoff.lat, dropoff.lng);
-  const fare = calculateFare(vType, distKm);
-  const id = uuid();
+    const distKm = distanceKm(pickup.lat, pickup.lng, dropoff.lat, dropoff.lng);
+    const fare = calculateFare(vType, distKm);
+    const id = uuid();
 
-  const trip = {
-    id,
-    riderId: req.user.id,
-    vehicleType,
-    pickup,
-    dropoff,
-    distanceKm: Math.round(distKm * 10) / 10,
-    fare,
-    status: "searching",
-    driverId: null,
-    declinedDriverIds: [],
-    createdAt: Date.now(),
-  };
-  db.trips.set(id, trip);
+    const trip = {
+      id, riderId: req.user.id, vehicleType, pickup, dropoff,
+      distanceKm: Math.round(distKm * 10) / 10, fare,
+      status: "searching", driverId: null, declinedDriverIds: [],
+    };
 
-  const driver = findNearestDriver(vehicleType, pickup);
-  const io = req.app.get("io");
+    const driver = await Drivers.findNearest(vehicleType, pickup);
+    if (driver) {
+      trip.driverId = driver.userId;
+      trip.status = "requested";
+    }
+    await Trips.create(trip);
 
-  if (driver) {
-    trip.driverId = driver.userId;
-    trip.status = "requested";
-    if (io) io.to(`driver:${driver.userId}`).emit("trip:request", tripToJSON(trip));
-  }
+    const io = req.app.get("io");
+    if (driver && io) io.to(`driver:${driver.userId}`).emit("trip:request", await tripToJSON(trip));
 
-  res.status(201).json({ trip: tripToJSON(trip) });
+    res.status(201).json({ trip: await tripToJSON(trip) });
+  } catch (e) { next(e); }
 });
 
-// إعادة محاولة المطابقة إذا لم يستجب السائق أو رفض
-router.post("/:id/rematch", requireAuth, (req, res) => {
-  const trip = db.trips.get(req.params.id);
-  if (!trip) return res.status(404).json({ error: "الرحلة غير موجودة" });
-  if (trip.riderId !== req.user.id) return res.status(403).json({ error: "غير مصرح" });
+router.post("/:id/rematch", requireAuth, async (req, res, next) => {
+  try {
+    const trip = await Trips.get(req.params.id);
+    if (!trip) return res.status(404).json({ error: "الرحلة غير موجودة" });
+    if (trip.riderId !== req.user.id) return res.status(403).json({ error: "غير مصرح" });
 
-  const driver = findNearestDriver(trip.vehicleType, trip.pickup, trip.declinedDriverIds);
-  const io = req.app.get("io");
-  if (driver) {
-    trip.driverId = driver.userId;
-    trip.status = "requested";
-    if (io) io.to(`driver:${driver.userId}`).emit("trip:request", tripToJSON(trip));
-  } else {
-    trip.status = "searching";
-    trip.driverId = null;
-  }
-  res.json({ trip: tripToJSON(trip) });
+    const driver = await Drivers.findNearest(trip.vehicleType, trip.pickup, trip.declinedDriverIds);
+    const io = req.app.get("io");
+    if (driver) {
+      await Trips.setDriver(trip.id, driver.userId, "requested");
+      if (io) io.to(`driver:${driver.userId}`).emit("trip:request", await tripToJSON(await Trips.get(trip.id)));
+    } else {
+      await Trips.setDriver(trip.id, null, "searching");
+    }
+    res.json({ trip: await tripToJSON(await Trips.get(trip.id)) });
+  } catch (e) { next(e); }
 });
 
-router.get("/:id", requireAuth, (req, res) => {
-  const trip = db.trips.get(req.params.id);
-  if (!trip) return res.status(404).json({ error: "الرحلة غير موجودة" });
-  res.json({ trip: tripToJSON(trip) });
+router.get("/:id", requireAuth, async (req, res, next) => {
+  try {
+    const trip = await Trips.get(req.params.id);
+    if (!trip) return res.status(404).json({ error: "الرحلة غير موجودة" });
+    res.json({ trip: await tripToJSON(trip) });
+  } catch (e) { next(e); }
 });
 
-router.get("/", requireAuth, (req, res) => {
-  const mine = [...db.trips.values()]
-    .filter((t) => t.riderId === req.user.id || t.driverId === req.user.id)
-    .sort((a, b) => b.createdAt - a.createdAt);
-  res.json({ trips: mine.map(tripToJSON) });
+router.get("/", requireAuth, async (req, res, next) => {
+  try {
+    const mine = await Trips.listForUser(req.user.id);
+    res.json({ trips: await Promise.all(mine.map(tripToJSON)) });
+  } catch (e) { next(e); }
 });
 
-router.post("/:id/accept", requireAuth, (req, res) => {
-  const trip = db.trips.get(req.params.id);
-  if (!trip) return res.status(404).json({ error: "الرحلة غير موجودة" });
-  if (trip.driverId !== req.user.id) return res.status(403).json({ error: "غير مصرح" });
-  trip.status = "accepted";
-  const io = req.app.get("io");
-  if (io) io.to(`trip:${trip.id}`).emit("trip:update", tripToJSON(trip));
-  res.json({ trip: tripToJSON(trip) });
+router.post("/:id/accept", requireAuth, async (req, res, next) => {
+  try {
+    const trip = await Trips.get(req.params.id);
+    if (!trip) return res.status(404).json({ error: "الرحلة غير موجودة" });
+    if (trip.driverId !== req.user.id) return res.status(403).json({ error: "غير مصرح" });
+    await Trips.setStatus(trip.id, "accepted");
+    const updated = await tripToJSON(await Trips.get(trip.id));
+    const io = req.app.get("io");
+    if (io) io.to(`trip:${trip.id}`).emit("trip:update", updated);
+    res.json({ trip: updated });
+  } catch (e) { next(e); }
 });
 
-router.post("/:id/decline", requireAuth, (req, res) => {
-  const trip = db.trips.get(req.params.id);
-  if (!trip) return res.status(404).json({ error: "الرحلة غير موجودة" });
-  if (trip.driverId !== req.user.id) return res.status(403).json({ error: "غير مصرح" });
+router.post("/:id/decline", requireAuth, async (req, res, next) => {
+  try {
+    const trip = await Trips.get(req.params.id);
+    if (!trip) return res.status(404).json({ error: "الرحلة غير موجودة" });
+    if (trip.driverId !== req.user.id) return res.status(403).json({ error: "غير مصرح" });
 
-  trip.declinedDriverIds.push(req.user.id);
-  const nextDriver = findNearestDriver(trip.vehicleType, trip.pickup, trip.declinedDriverIds);
-  const io = req.app.get("io");
-  if (nextDriver) {
-    trip.driverId = nextDriver.userId;
-    trip.status = "requested";
-    if (io) io.to(`driver:${nextDriver.userId}`).emit("trip:request", tripToJSON(trip));
-  } else {
-    trip.driverId = null;
-    trip.status = "searching";
-  }
-  if (io) io.to(`trip:${trip.id}`).emit("trip:update", tripToJSON(trip));
-  res.json({ trip: tripToJSON(trip) });
+    await Trips.addDeclinedDriver(trip.id, req.user.id);
+    const refreshed = await Trips.get(trip.id);
+    const nextDriver = await Drivers.findNearest(trip.vehicleType, trip.pickup, refreshed.declinedDriverIds);
+    const io = req.app.get("io");
+    if (nextDriver) {
+      await Trips.setDriver(trip.id, nextDriver.userId, "requested");
+      if (io) io.to(`driver:${nextDriver.userId}`).emit("trip:request", await tripToJSON(await Trips.get(trip.id)));
+    } else {
+      await Trips.setDriver(trip.id, null, "searching");
+    }
+    const updated = await tripToJSON(await Trips.get(trip.id));
+    if (io) io.to(`trip:${trip.id}`).emit("trip:update", updated);
+    res.json({ trip: updated });
+  } catch (e) { next(e); }
 });
 
-router.post("/:id/start", requireAuth, (req, res) => {
-  const trip = db.trips.get(req.params.id);
-  if (!trip) return res.status(404).json({ error: "الرحلة غير موجودة" });
-  if (trip.driverId !== req.user.id) return res.status(403).json({ error: "غير مصرح" });
-  trip.status = "ongoing";
-  trip.startedAt = Date.now();
-  const io = req.app.get("io");
-  if (io) io.to(`trip:${trip.id}`).emit("trip:update", tripToJSON(trip));
-  res.json({ trip: tripToJSON(trip) });
+router.post("/:id/start", requireAuth, async (req, res, next) => {
+  try {
+    const trip = await Trips.get(req.params.id);
+    if (!trip) return res.status(404).json({ error: "الرحلة غير موجودة" });
+    if (trip.driverId !== req.user.id) return res.status(403).json({ error: "غير مصرح" });
+    await Trips.setStatus(trip.id, "ongoing");
+    const updated = await tripToJSON(await Trips.get(trip.id));
+    const io = req.app.get("io");
+    if (io) io.to(`trip:${trip.id}`).emit("trip:update", updated);
+    res.json({ trip: updated });
+  } catch (e) { next(e); }
 });
 
-router.post("/:id/complete", requireAuth, (req, res) => {
-  const trip = db.trips.get(req.params.id);
-  if (!trip) return res.status(404).json({ error: "الرحلة غير موجودة" });
-  if (trip.driverId !== req.user.id) return res.status(403).json({ error: "غير مصرح" });
-  trip.status = "completed";
-  trip.completedAt = Date.now();
-
-  const driver = db.drivers.get(req.user.id);
-  if (driver) {
-    driver.totalTrips += 1;
-    driver.earningsToday += trip.fare;
-  }
-  const io = req.app.get("io");
-  if (io) io.to(`trip:${trip.id}`).emit("trip:update", tripToJSON(trip));
-  res.json({ trip: tripToJSON(trip) });
+router.post("/:id/complete", requireAuth, async (req, res, next) => {
+  try {
+    const trip = await Trips.get(req.params.id);
+    if (!trip) return res.status(404).json({ error: "الرحلة غير موجودة" });
+    if (trip.driverId !== req.user.id) return res.status(403).json({ error: "غير مصرح" });
+    await Trips.setStatus(trip.id, "completed");
+    await Drivers.registerCompletedTrip(req.user.id, trip.fare);
+    const updated = await tripToJSON(await Trips.get(trip.id));
+    const io = req.app.get("io");
+    if (io) io.to(`trip:${trip.id}`).emit("trip:update", updated);
+    res.json({ trip: updated });
+  } catch (e) { next(e); }
 });
 
-router.post("/:id/cancel", requireAuth, (req, res) => {
-  const trip = db.trips.get(req.params.id);
-  if (!trip) return res.status(404).json({ error: "الرحلة غير موجودة" });
-  if (trip.riderId !== req.user.id && trip.driverId !== req.user.id) {
-    return res.status(403).json({ error: "غير مصرح" });
-  }
-  trip.status = "cancelled";
-  const io = req.app.get("io");
-  if (io) io.to(`trip:${trip.id}`).emit("trip:update", tripToJSON(trip));
-  res.json({ trip: tripToJSON(trip) });
+router.post("/:id/cancel", requireAuth, async (req, res, next) => {
+  try {
+    const trip = await Trips.get(req.params.id);
+    if (!trip) return res.status(404).json({ error: "الرحلة غير موجودة" });
+    if (trip.riderId !== req.user.id && trip.driverId !== req.user.id) {
+      return res.status(403).json({ error: "غير مصرح" });
+    }
+    await Trips.setStatus(trip.id, "cancelled");
+    const updated = await tripToJSON(await Trips.get(trip.id));
+    const io = req.app.get("io");
+    if (io) io.to(`trip:${trip.id}`).emit("trip:update", updated);
+    res.json({ trip: updated });
+  } catch (e) { next(e); }
 });
 
-router.post("/:id/rate", requireAuth, (req, res) => {
-  const trip = db.trips.get(req.params.id);
-  const { stars } = req.body;
-  if (!trip) return res.status(404).json({ error: "الرحلة غير موجودة" });
-  if (trip.riderId !== req.user.id) return res.status(403).json({ error: "غير مصرح" });
-  const driver = db.drivers.get(trip.driverId);
-  if (driver && stars) {
-    driver.rating = Math.round(((driver.rating + stars) / 2) * 10) / 10;
-  }
-  trip.riderRating = stars;
-  res.json({ trip: tripToJSON(trip) });
+router.post("/:id/rate", requireAuth, async (req, res, next) => {
+  try {
+    const trip = await Trips.get(req.params.id);
+    const { stars } = req.body;
+    if (!trip) return res.status(404).json({ error: "الرحلة غير موجودة" });
+    if (trip.riderId !== req.user.id) return res.status(403).json({ error: "غير مصرح" });
+    if (trip.driverId && stars) {
+      const driver = await Drivers.get(trip.driverId);
+      const newRating = Math.round(((driver.rating + stars) / 2) * 10) / 10;
+      await Drivers.updateRating(trip.driverId, newRating);
+    }
+    await Trips.setRating(trip.id, stars);
+    res.json({ trip: await tripToJSON(await Trips.get(trip.id)) });
+  } catch (e) { next(e); }
 });
 
 module.exports = router;

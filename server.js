@@ -6,6 +6,7 @@ const { Server } = require("socket.io");
 const jwt = require("jsonwebtoken");
 
 const { JWT_SECRET } = require("./src/middleware/auth");
+const { initSchema } = require("./src/database");
 const authRoutes = require("./src/routes/auth");
 const vehicleTypesRoutes = require("./src/routes/vehicleTypes");
 const driversRoutes = require("./src/routes/drivers");
@@ -62,6 +63,15 @@ io.on("connection", (socket) => {
 });
 
 const PORT = process.env.PORT || 4000;
-server.listen(PORT, () => {
-  console.log(`✅ خادم سهل يعمل على http://localhost:${PORT}`);
-});
+
+initSchema()
+  .then(() => {
+    server.listen(PORT, () => {
+      console.log(`✅ خادم سهل يعمل على http://localhost:${PORT}`);
+    });
+  })
+  .catch((err) => {
+    console.error("❌ فشل الاتصال بقاعدة البيانات:", err.message);
+    console.error("تأكد من تعريف متغير DATABASE_URL بشكل صحيح");
+    process.exit(1);
+  });
